@@ -77,6 +77,18 @@ describe("matchCreditForPosting — amount splits same-name credits (Aspire 'Hil
     expect(matchCreditForPosting(aspire, "Hilton", 75)?.name).toBe("Hilton Resort Credit");
   });
 
+  test("an amount fitting both credits but matching neither stays unassigned", () => {
+    // A $30 'Hilton' could be a partial flight credit (a $30 airfare)
+    // or a partial resort credit (a $30 resort charge) — only the
+    // triggering charge can tell, so the matcher must not guess.
+    expect(matchCreditForPosting(aspire, "Hilton", 30)).toBeUndefined();
+    expect(matchCreditForPosting(aspire, "Hilton", -30)).toBeUndefined();
+  });
+
+  test("an amount beyond every candidate stays unassigned", () => {
+    expect(matchCreditForPosting(aspire, "Hilton", 250)).toBeUndefined();
+  });
+
   test("a clawback (negative amount) follows its original credit", () => {
     expect(matchCreditForPosting(aspire, "Hilton", -50)?.name).toBe("Flight Credit");
     expect(matchCreditForPosting(aspire, "Hilton", -200)?.name).toBe("Hilton Resort Credit");

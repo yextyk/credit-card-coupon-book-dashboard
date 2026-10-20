@@ -446,12 +446,18 @@ export function patternMatches(matchPattern: string, postingName: string): boole
  * is known. Some issuers post two different credits under one identical
  * name (Amex posts BOTH the Aspire $50 quarterly flight credit and the
  * $200 semiannual resort credit as a bare "Hilton"), so among the
- * candidates an exact amount match with a credit's amount wins first;
- * failing that, the first candidate whose amount can absorb the
- * posting wins (a payout can never exceed the credit's own amount, so
- * a $75 "Hilton" posting cannot be the $50 flight credit). Returns
- * undefined when nothing matches (the posting stays unassigned for
- * manual review).
+ * candidates an exact amount match with a credit's amount wins first
+ * ($50 → flight, $200 → resort). Failing that, a candidate whose amount
+ * can absorb the posting beats one that cannot (a payout can never
+ * exceed the credit's own amount, so a $75 "Hilton" posting cannot be
+ * the $50 flight credit). But when the amount fits SEVERAL candidates
+ * exactly none of them — a $30 "Hilton" could be a partial flight
+ * credit or a partial resort credit — the posting is left UNASSIGNED
+ * rather than guessed: only the triggering charge (an airline charge
+ * vs a Hilton property charge in the same days) can tell those apart,
+ * and a wrong auto-assignment silently corrupts both credits' usage.
+ * Returns undefined when nothing matches (the posting stays unassigned
+ * for manual review).
  */
 export function matchCreditForPosting<
   T extends { matchPattern: string; amount?: number },
@@ -466,9 +472,14 @@ export function matchCreditForPosting<
   const abs = Math.abs(postingAmount);
   const exact = candidates.find((c) => c.amount != null && c.amount === abs);
   if (exact) return exact;
-  const feasible = candidates.find((c) => c.amount != null && c.amount >= abs);
-  if (feasible) return feasible;
-  return candidates[0];
+  const feasible = candidates.filter((c) => c.amount != null && c.amount >= abs);
+  if (feasible.length === 1) return feasible[0];
+  if (feasible.length > 1) return undefined;
+  // No candidate can absorb the posting. When some candidates carry no
+  // amount at all, amount reasoning does not apply — keep the legacy
+  // first-match behavior for them; otherwise the posting belongs to
+  // none of the candidates and stays unassigned.
+  return candidates.some((c) => c.amount == null) ? candidates[0] : undefined;
 }
 
 /** Issuer ("Amex" / "Chase" / "U.S. Bank") for a card, inferred from its product name. */
@@ -2056,6 +2067,7 @@ export const Actions = {
         "1. Run `/opt/hatch/bin/plaid accounts` and collect every account: plaidAccountId = account_id, name, mask, balance = balances.current, creditLimit = balances.limit, currency = balances.iso_currency_code. The output groups accounts by login under `institutions` — each institution entry is ONE login, but owners are PEOPLE, not logins: one person can hold several logins (e.g. their Amex login and their Chase login), and this household has up to two people. Attribute accounts to people: set owner = \"A\" for the first person and owner = \"B\" for the second, deciding from the account evidence — the cardholder names on the accounts and which products each login holds — so that ALL of one person's accounts, across every one of their logins, carry that person's key. If you cannot tell which person a login's accounts belong to, OMIT owner for those accounts entirely: the dashboard lists them under 'login not identified yet' for the user to resolve. Never guess an owner from a grouping's position in the output. (Owner is sticky in storage — the import only fills accounts that have none yet and never overwrites an existing attribution — so a careful read matters most on the first refresh.)",
         `2. Run \`/opt/hatch/bin/plaid transactions-get --start-date ${windowStart} --end-date ${today}\` (dates are ${timezone} calendar dates). Fetch ONLY this window — ${windowReason}. Do not widen it. Keep only statement-credit postings: not pending, and the transaction name contains 'credit' or 'reimbursement' (case-insensitive) or is exactly 'Hilton'. (Amex pays some credits as a 'Reimbursement' with no 'credit' in the name — e.g. the Platinum airline fee credit posts as 'AMEX Airline Fee Reimbursement'; keep those too.) Postings run in BOTH directions: a credit the issuer PAID (Plaid amount < 0) and a REVERSAL / clawback of an earlier credit (Plaid amount > 0 under a credit name — the issuer took the credit back). Keep both. For each kept transaction produce: txnId = transaction_id, accountPlaidId = account_id, date = the transaction's posted date (its \`date\` field), transactionDate = its authorized_date — pass authorized_date as transactionDate for EVERY posting (when Plaid gives no authorized_date, set transactionDate to the posted date). Credits count toward the period of the TRANSACTION date, not the posting date; the posted date is kept for display only. name, amount = the NEGATION of Plaid's amount: positive dollars when the issuer paid a credit, NEGATIVE dollars when the issuer reversed or clawed one back. Signed amounts are how corrections are represented — the store never deletes, so a clawback must arrive as a negative posting that nets against the original credit; never drop a reversal and never flip its sign.`,
         `3. Call this artifact's \`importSnapshot\` action with { accounts, postings, windowStart: "${windowStart}", windowEnd: "${today}", complete } exactly in that shape. Set complete to true ONLY if the Plaid accounts and transactions reads both succeeded for the entire window; if any read failed, was cut off, or returned partial data, set complete to false — the import then still merges what you read but does NOT certify the window as covered, so the next refresh retries this window instead of assuming coverage. The import is MERGE-ONLY: it inserts postings whose transaction id is new and never deletes, clears, or replaces stored data, so postings from earlier (back to ${floorStart}) that fall outside this fetched window are preserved and keep counting — do not try to re-send or 'restore' them, and never pass an empty snapshot to reset anything. (One exception: if a re-fetched posting's authorized_date differs from what was stored, the import corrects its transactionDate in place — that is expected; always send both dates exactly as Plaid reports them.) Call importSnapshot even if the window contains zero new postings (accounts plus an empty postings array, complete: true when the empty result is a successful read), so the refresh is recorded. Do not invent, rename, or round any values; copy names and amounts from the Plaid output verbatim. If Plaid reports not connected or a read fails, still call importSnapshot with whatever complete data you could read and complete: false, and say what was missing in your final message.`,
+        "4. After the import, call this artifact's `getDashboard` action and check its `unassigned` list for postings named exactly 'Hilton' on Hilton Honors Aspire Card accounts. The import deliberately leaves a bare 'Hilton' posting unassigned when its amount fits both Aspire credits without exactly matching either one (for example $30 — it could be a partial flight credit or a partial resort credit, and the name alone cannot tell). Resolve each such posting from the transactions you already fetched in step 2: find that account's charge whose authorized_date is the posting's transactionDate or a few days earlier and whose amount is at least the posting's amount — if it is an airline or Amex Travel charge, the posting is that account's quarterly Flight Credit; if it is a Hilton hotel or resort charge, the posting is the Hilton Resort Credit. Assign it with this artifact's `assignPosting` action (postingId from the unassigned list; creditId of the matching credit on that same account from the dashboard's credits list). If no triggering charge is visible in the fetched window, leave the posting unassigned and name it in your final message — never guess.",
       ].join("\n");
       const res = await ctx.agent.spawnTask(message, {
         expectsAction: "importSnapshot",
