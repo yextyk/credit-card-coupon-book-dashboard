@@ -68,7 +68,11 @@ const PERSONAL_PLAT: CreditDef[] = [
 ];
 
 const ASPIRE: CreditDef[] = [
-  { name: "Flight Credit", amount: 50, period: "quarterly", pattern: "flight credit", note: "Flights booked directly with airlines or Amex Travel" },
+  // Amex posts the flight credit under the bare name "Hilton" — the
+  // same name as the resort credit below. The pattern therefore claims
+  // "Hilton" too, and matchCreditForPosting splits the two by amount:
+  // $50 postings land here, $200 postings on the resort credit.
+  { name: "Flight Credit", amount: 50, period: "quarterly", pattern: "flight credit|hilton", note: "Flights booked directly with airlines or Amex Travel" },
   // Amex runs the resort credit on CALENDAR halves — $200 from
   // January through June and another $200 from July through December
   // (per the benefit terms for the Aspire card) — NOT on the
@@ -422,19 +426,49 @@ export function enrollmentInfoFor(
 }
 
 /**
- * Auto-mapping rule for imported postings: the first of the account's
- * credits whose non-empty match pattern is a case-insensitive substring of
- * the posting name wins. Returns undefined when nothing matches (the
- * posting stays unassigned for manual review).
+ * Whether a credit's match pattern claims a posting name. A pattern is
+ * a case-insensitive substring; several alternatives may be joined with
+ * "|" (the posting name needs to contain any one of them). An empty
+ * pattern never matches.
  */
-export function matchCreditForPosting<T extends { matchPattern: string }>(
+export function patternMatches(matchPattern: string, postingName: string): boolean {
+  if (matchPattern === "") return false;
+  const lower = postingName.toLowerCase();
+  return matchPattern
+    .split("|")
+    .some((alt) => alt.trim() !== "" && lower.includes(alt.trim().toLowerCase()));
+}
+
+/**
+ * Auto-mapping rule for imported postings: the account's credits whose
+ * match pattern claims the posting name are the candidates, and the
+ * first candidate wins — with one refinement when the posting amount
+ * is known. Some issuers post two different credits under one identical
+ * name (Amex posts BOTH the Aspire $50 quarterly flight credit and the
+ * $200 semiannual resort credit as a bare "Hilton"), so among the
+ * candidates an exact amount match with a credit's amount wins first;
+ * failing that, the first candidate whose amount can absorb the
+ * posting wins (a payout can never exceed the credit's own amount, so
+ * a $75 "Hilton" posting cannot be the $50 flight credit). Returns
+ * undefined when nothing matches (the posting stays unassigned for
+ * manual review).
+ */
+export function matchCreditForPosting<
+  T extends { matchPattern: string; amount?: number },
+>(
   credits: readonly T[],
   postingName: string,
+  postingAmount?: number,
 ): T | undefined {
-  const lower = postingName.toLowerCase();
-  return credits.find(
-    (c) => c.matchPattern !== "" && lower.includes(c.matchPattern.toLowerCase()),
-  );
+  const candidates = credits.filter((c) => patternMatches(c.matchPattern, postingName));
+  if (candidates.length === 0) return undefined;
+  if (postingAmount == null) return candidates[0];
+  const abs = Math.abs(postingAmount);
+  const exact = candidates.find((c) => c.amount != null && c.amount === abs);
+  if (exact) return exact;
+  const feasible = candidates.find((c) => c.amount != null && c.amount >= abs);
+  if (feasible) return feasible;
+  return candidates[0];
 }
 
 /** Issuer ("Amex" / "Chase" / "U.S. Bank") for a card, inferred from its product name. */
@@ -1103,9 +1137,27 @@ async function materializeSynthesizedCredit(
       .select()
       .from(schema.postings)
       .where(isNull(schema.postings.creditId));
+    // Claim only the postings the shared matching rule assigns to THIS
+    // def — a sibling def may claim the same posting name (the Aspire
+    // flight and resort credits both post as "Hilton") and win it on
+    // amount. Accounts with no catalog fall back to this def's own
+    // pattern plus an amount-feasibility check.
+    const siblings = (catalogFor(inst.account.name) ?? []).map((d) => ({
+      name: d.name,
+      matchPattern: d.pattern,
+      amount: d.amount,
+    }));
     for (const p of unassigned) {
       if (p.accountId !== inst.account.id) continue;
-      if (!p.name.toLowerCase().includes(inst.def.pattern.toLowerCase())) continue;
+      const winner =
+        siblings.length > 0
+          ? matchCreditForPosting(siblings, p.name, p.amount)
+          : undefined;
+      const claims = winner
+        ? winner.name === inst.def.name
+        : patternMatches(inst.def.pattern, p.name) &&
+          Math.abs(p.amount) <= inst.def.amount;
+      if (!claims) continue;
       await db
         .update(schema.postings)
         .set({ creditId: row.id })
@@ -1245,7 +1297,7 @@ async function computeDashboard(
         if (p.creditId != null) continue;
         const candidates = synthesizedByAccount.get(p.accountId);
         if (!candidates || candidates.length === 0) continue;
-        const match = matchCreditForPosting(candidates, p.name);
+        const match = matchCreditForPosting(candidates, p.name, p.amount);
         if (!match) continue;
         const arr = effectivePostingsByCredit.get(match.id) ?? [];
         arr.push(p);
@@ -1829,7 +1881,7 @@ export const Actions = {
         const liveCredits = (creditsByAccount.get(acct.id) ?? []).filter(
           (c) => c.deleted === 0,
         );
-        const match = matchCreditForPosting(liveCredits, p.name);
+        const match = matchCreditForPosting(liveCredits, p.name, p.amount);
         const insertedPosting = await db
           .insert(schema.postings)
           .values({

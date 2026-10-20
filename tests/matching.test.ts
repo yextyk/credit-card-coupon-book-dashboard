@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   catalogFor,
   matchCreditForPosting,
+  patternMatches,
   suspectedDuplicatesFor,
 } from "../server/src/actions";
 
@@ -52,6 +53,44 @@ describe("matchCreditForPosting — posting name to credit auto-mapping", () => 
     );
     expect(matchCreditForPosting(asCredits("Business Platinum Card®"), "CREDIT ADJUSTMENT")).toBeUndefined();
     expect(matchCreditForPosting(asCredits("Hilton Honors Aspire Card"), "CREDIT ADJUSTMENT")).toBeUndefined();
+  });
+});
+
+describe("matchCreditForPosting — amount splits same-name credits (Aspire 'Hilton')", () => {
+  // Amex posts BOTH Aspire credits under the bare name "Hilton": the
+  // $50 quarterly flight credit (e.g. the TravelBank reimbursement)
+  // and the $200 semiannual resort credit. Only the amount tells them
+  // apart — a name-only rule sends every "Hilton" posting to the
+  // resort credit, which is what mis-filed the Q4 2026 flight credits.
+  const aspire = (catalogFor("Hilton Honors Aspire Card") ?? []).map((d) => ({
+    name: d.name,
+    matchPattern: d.pattern,
+    amount: d.amount,
+  }));
+
+  test("a $50 'Hilton' posting is the flight credit, a $200 one the resort credit", () => {
+    expect(matchCreditForPosting(aspire, "Hilton", 50)?.name).toBe("Flight Credit");
+    expect(matchCreditForPosting(aspire, "Hilton", 200)?.name).toBe("Hilton Resort Credit");
+  });
+
+  test("a payout too large for the flight credit lands on the resort credit", () => {
+    expect(matchCreditForPosting(aspire, "Hilton", 75)?.name).toBe("Hilton Resort Credit");
+  });
+
+  test("a clawback (negative amount) follows its original credit", () => {
+    expect(matchCreditForPosting(aspire, "Hilton", -50)?.name).toBe("Flight Credit");
+    expect(matchCreditForPosting(aspire, "Hilton", -200)?.name).toBe("Hilton Resort Credit");
+  });
+
+  test("pattern alternatives claim each listed name and nothing else", () => {
+    expect(patternMatches("flight credit|hilton", "Hilton")).toBe(true);
+    expect(patternMatches("flight credit|hilton", "AMEX Flight Credit")).toBe(true);
+    expect(patternMatches("flight credit|hilton", "AMEX Dining Credit")).toBe(false);
+    expect(matchCreditForPosting(aspire, "AMEX Flight Credit", 50)?.name).toBe("Flight Credit");
+  });
+
+  test("without an amount the first candidate wins, as before", () => {
+    expect(matchCreditForPosting(aspire, "Hilton")?.name).toBe("Flight Credit");
   });
 });
 
