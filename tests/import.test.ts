@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { asc } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { addDays, Actions, periodBounds } from "../server/src/actions";
 import * as schema from "../server/src/schema";
 import { createTestDb, fakeCtx, todayLA } from "./helpers";
-import { ALEX_ASPIRE, ALEX_BIZ_PLAT, ALEX_SAPPHIRE, JANUARY_SNAPSHOT, SAM_MS_PLATINUM } from "./fixtures/sample";
+import { ALEX_ASPIRE, ALEX_BIZ_PLAT, ALEX_IHG_PREMIER, ALEX_SAPPHIRE, JANUARY_SNAPSHOT, SAM_MS_PLATINUM } from "./fixtures/sample";
 
 async function importJanuary(db: ReturnType<typeof createTestDb>) {
   return Actions.importSnapshot.handler(fakeCtx(db), structuredClone(JANUARY_SNAPSHOT) as any);
@@ -521,5 +521,121 @@ describe("importSnapshot — seeded defaults are truthful, never assumed", () =>
     const flight = credits.find((c) => c.name === "Flight Credit")!;
     expect(flight.anchorMonth).toBeNull();
     expect(flight.anchorConfirmed).toBe(1);
+  });
+});
+
+describe("match pattern inheritance — addCredit default and import self-heal", () => {
+  async function seedIhg(db: ReturnType<typeof createTestDb>) {
+    const today = todayLA();
+    await Actions.importSnapshot.handler(fakeCtx(db), {
+      complete: true,
+      windowStart: periodBounds("annual", today).start,
+      windowEnd: today,
+      accounts: [ALEX_IHG_PREMIER],
+      postings: [],
+    } as any);
+    const account = (await db.select().from(schema.accounts))[0]!;
+    return { account, today };
+  }
+
+  test("addCredit without a matchPattern inherits the catalog pattern; an explicit one is kept", async () => {
+    const db = createTestDb();
+    const ctx = fakeCtx(db);
+    const { account } = await seedIhg(db);
+    const seeded = (
+      await db.select().from(schema.credits).where(eq(schema.credits.accountId, account.id))
+    )[0]!;
+    expect(seeded.name).toBe("Airline Credit");
+    expect(seeded.matchPattern).toBe("airline credit");
+
+    // Delete the seeded row, then re-add it by hand WITHOUT a
+    // matchPattern (the old manual flow that produced patternless
+    // rows): the tombstone revive must carry the catalog pattern,
+    // not the old empty default.
+    await Actions.deleteCredit.handler(ctx, { id: seeded.id });
+    const revived: any = await Actions.addCredit.handler(ctx, {
+      accountId: account.id,
+      name: "Airline Credit",
+      amount: 100,
+      period: "annual",
+      note: "",
+    });
+    expect(revived.id).toBe(seeded.id);
+    const byId = new Map(
+      (await db.select().from(schema.credits)).map((c) => [c.id, c]),
+    );
+    expect(byId.get(revived.id)!.matchPattern).toBe("airline credit");
+
+    // An explicitly passed pattern is the caller's choice and is never
+    // overridden, and a name with no catalog def inherits nothing.
+    const custom: any = await Actions.addCredit.handler(ctx, {
+      accountId: account.id,
+      name: "Made-Up Credit",
+      amount: 10,
+      period: "annual",
+      note: "",
+      matchPattern: "custom",
+    });
+    const plain: any = await Actions.addCredit.handler(ctx, {
+      accountId: account.id,
+      name: "Another Made-Up Credit",
+      amount: 10,
+      period: "annual",
+      note: "",
+    });
+    const after = new Map(
+      (await db.select().from(schema.credits)).map((c) => [c.id, c]),
+    );
+    expect(after.get(custom.id)!.matchPattern).toBe("custom");
+    expect(after.get(plain.id)!.matchPattern).toBe("");
+  });
+
+  test("importSnapshot heals an existing patternless row and the posting then auto-matches", async () => {
+    const db = createTestDb();
+    const ctx = fakeCtx(db);
+    const { account, today } = await seedIhg(db);
+
+    // Simulate the legacy broken state: the stored Airline Credit row
+    // with its match pattern blanked, so nothing can auto-match it.
+    await db
+      .update(schema.credits)
+      .set({ matchPattern: "" })
+      .where(eq(schema.credits.accountId, account.id));
+    // A user pattern on the same account must survive the heal.
+    const custom: any = await Actions.addCredit.handler(ctx, {
+      accountId: account.id,
+      name: "Made-Up Credit",
+      amount: 10,
+      period: "annual",
+      note: "",
+      matchPattern: "custom",
+    });
+
+    const res: any = await Actions.importSnapshot.handler(ctx, {
+      complete: true,
+      windowStart: periodBounds("annual", today).start,
+      windowEnd: today,
+      accounts: [ALEX_IHG_PREMIER],
+      postings: [
+        {
+          txnId: "fake-txn-ihg-airline-credit",
+          accountPlaidId: ALEX_IHG_PREMIER.plaidAccountId,
+          date: today,
+          name: "AIRLINE CREDIT",
+          amount: 100,
+        },
+      ],
+    } as any);
+    expect(res.patternsHealed).toBe(1);
+
+    const credits = await db.select().from(schema.credits);
+    const airline = credits.find((c) => c.name === "Airline Credit")!;
+    expect(airline.matchPattern).toBe("airline credit");
+    expect(credits.find((c) => c.id === custom.id)!.matchPattern).toBe("custom");
+
+    // The heal took effect in the same import: the posting is
+    // auto-classified onto the healed credit, not left unassigned.
+    const posting = (await db.select().from(schema.postings))[0]!;
+    expect(posting.creditId).toBe(airline.id);
   });
 });

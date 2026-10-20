@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   catalogFor,
+  catalogPatternFor,
   defaultNameFor,
   DEFAULT_ENROLLMENT_NOTE,
   DEFAULT_OWNER_LABELS,
@@ -292,6 +293,56 @@ describe("enrollmentRequired — catalog metadata", () => {
       required: false,
       note: null,
     });
+  });
+});
+
+describe("catalog defs — match patterns are never empty", () => {
+  // One representative account name per supported product (seeded and
+  // non-seeded defs alike).
+  const PRODUCTS = [
+    "Business Platinum Card®",
+    "Business Gold Card",
+    "The Platinum Card®",
+    "Morgan Stanley Platinum Card®",
+    "Hilton Honors Aspire Card",
+    "Marriott Bonvoy Brilliant® American Express® Card",
+    "Chase Sapphire Preferred®",
+    "World of Hyatt Business Credit Card",
+    "IHG One Rewards Premier Credit Card",
+    "The Ritz-Carlton® Credit Card",
+    "Marriott Bonvoy Boundless® Credit Card",
+    "United℠ Explorer Card",
+    "United℠ Business Card",
+    "Aeroplan® Credit Card",
+    "U.S. Bank Altitude® Reserve Visa Infinite® Card",
+    "U.S. Bank Triple Cash Rewards Visa® Business Card",
+  ];
+
+  test("every catalog def carries a non-empty match pattern", () => {
+    // A def with an empty pattern can never auto-match a posting: its
+    // credits would silently pile up in Unassigned.
+    for (const product of PRODUCTS) {
+      const defs = [...(catalogFor(product) ?? []), ...nonSeededDefsFor(product)];
+      for (const d of defs) {
+        expect(d.pattern).not.toBe("");
+      }
+    }
+  });
+
+  test("catalogPatternFor resolves a def's pattern by product and credit name", () => {
+    expect(catalogPatternFor("IHG One Rewards Premier Credit Card", "Airline Credit")).toBe(
+      "airline credit",
+    );
+    expect(catalogPatternFor("Hilton Honors Aspire Card", "Flight Credit")).toBe(
+      "flight credit|hilton",
+    );
+    // Matching is by trimmed, case-insensitive exact name.
+    expect(catalogPatternFor("IHG One Rewards Premier Credit Card", " airline credit ")).toBe(
+      "airline credit",
+    );
+    // No def by that name on the product → no pattern to inherit.
+    expect(catalogPatternFor("IHG One Rewards Premier Credit Card", "Made-Up Credit")).toBe("");
+    expect(catalogPatternFor("Generic Store Card", "Airline Credit")).toBe("");
   });
 });
 

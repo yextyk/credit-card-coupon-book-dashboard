@@ -426,6 +426,22 @@ export function enrollmentInfoFor(
 }
 
 /**
+ * The catalog match pattern for one credit instance, resolved from the
+ * catalog defs by (account product, credit name) exactly like
+ * enrollmentInfoFor. Returns "" when the credit's name matches no def
+ * on the account's product (e.g. a user-created row).
+ */
+export function catalogPatternFor(accountName: string, creditName: string): string {
+  const key = creditName.trim().toLowerCase();
+  const defs = [
+    ...(catalogFor(accountName) ?? []),
+    ...nonSeededDefsFor(accountName),
+  ];
+  const def = defs.find((d) => d.name.trim().toLowerCase() === key);
+  return def?.pattern ?? "";
+}
+
+/**
  * Whether a credit's match pattern claims a posting name. A pattern is
  * a case-insensitive substring; several alternatives may be joined with
  * "|" (the posting name needs to contain any one of them). An empty
@@ -1691,6 +1707,8 @@ export const Actions = {
       postingsSkipped: z.number(),
       /** Known postings whose stored transactionDate was corrected in place. */
       postingsCorrected: z.number(),
+      /** Stored credits whose empty match pattern was filled from the catalog. */
+      patternsHealed: z.number(),
       /** Postings already stored before this import — all of them are kept. */
       existingPostingsPreserved: z.number(),
       /** Earliest date the stored postings now cumulatively cover. */
@@ -1824,6 +1842,33 @@ export const Actions = {
           .values(rows)
           .returning();
         creditsByAccount.set(acct.id, insertedCredits);
+      }
+
+      // Self-heal patternless stored credits: a row created without a
+      // match pattern (addCredit used to default it to "") can never
+      // auto-match a posting, so its credits silently pile up in
+      // Unassigned. When the catalog carries a def with the same name
+      // on the account's product, fill the empty pattern from the
+      // catalog — in storage and in the in-memory rows the posting
+      // import below matches against, so the heal takes effect in this
+      // same import. Only empty patterns are filled: a non-empty
+      // stored pattern is the user's state and is never overwritten.
+      const accountById = new Map(allAccounts.map((a) => [a.id, a]));
+      let patternsHealed = 0;
+      for (const credits of creditsByAccount.values()) {
+        for (const c of credits) {
+          if (c.deleted !== 0 || c.matchPattern !== "") continue;
+          const acct = accountById.get(c.accountId);
+          if (!acct) continue;
+          const pattern = catalogPatternFor(acct.name, c.name);
+          if (pattern === "") continue;
+          await db
+            .update(schema.credits)
+            .set({ matchPattern: pattern })
+            .where(eq(schema.credits.id, c.id));
+          c.matchPattern = pattern;
+          patternsHealed++;
+        }
       }
 
       // Import postings, deduped by Plaid transaction id, auto-mapped by
@@ -2001,6 +2046,7 @@ export const Actions = {
         postingsAdded,
         postingsSkipped,
         postingsCorrected,
+        patternsHealed,
         existingPostingsPreserved: existingPostingsCount,
         dataCoverageStart,
       };
@@ -2368,6 +2414,15 @@ export const Actions = {
       if (!account) throw new Error("addCredit: account not found");
       // Never assume enrollment for a benefit that requires it.
       const enrollment = enrollmentInfoFor(account.name, args.name);
+      // A credit whose name matches a catalog def but carries no match
+      // pattern is almost always an omission, not an intent: a
+      // patternless credit can never auto-match a posting, so its
+      // credits would silently pile up in Unassigned. Inherit the
+      // catalog pattern when the caller left it empty; an explicitly
+      // passed non-empty pattern is never overridden.
+      const matchPattern = args.matchPattern
+        ? args.matchPattern
+        : catalogPatternFor(account.name, args.name);
       const values = {
         accountId: args.accountId,
         name: args.name,
@@ -2380,7 +2435,7 @@ export const Actions = {
         enrolled: enrollment.required ? 0 : 1,
         enrolledAsserted: 0,
         note: args.note,
-        matchPattern: args.matchPattern,
+        matchPattern,
         sortOrder: 100,
       };
       // Re-adding a credit the user once deleted REVIVES its tombstone
